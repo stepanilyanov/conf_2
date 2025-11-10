@@ -1,0 +1,14 @@
+@startuml
+skinparam monochrome true
+skinparam shadowing false
+skinparam defaultFontName Arial
+skinparam packageStyle rect
+left to right direction
+
+package "react\n18.2.0" as react
+package "loose-envify\n1.4.0" as loose_envify
+package "js-tokens\n4.0.0" as js_tokens
+
+react --> loose_envify : ^1.1.0
+loose_envify --> js_tokens : ^4.0.0
+@enduml
