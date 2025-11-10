@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Инструмент визуализации графа зависимостей пакетов
-Этап 2: Сбор данных о зависимостях (исправленная версия с GitHub)
+Этап 3: Основные операции
 """
 
 import argparse
@@ -10,12 +10,15 @@ import os
 import json
 import urllib.request
 import urllib.error
-import re
-from urllib.parse import urljoin
+from collections import deque, defaultdict
 
 class DependencyVisualizer:
     def __init__(self):
         self.config = {}
+        self.dependency_graph = defaultdict(dict)
+        self.visited = set()
+        self.recursion_stack = set()
+        self.cycle_detected = False
         
     def parse_arguments(self):
         """Парсинг аргументов командной строки"""
@@ -65,182 +68,191 @@ class DependencyVisualizer:
         """Валидация аргументов командной строки"""
         errors = []
         
-        # Проверка имени пакета
         if not args.package or not args.package.strip():
             errors.append("Имя пакета не может быть пустым")
         
-        # Проверка источника
         if not args.source or not args.source.strip():
             errors.append("Источник (URL или путь к файлу) не может быть пустым")
         
-        # Проверка выходного файла
         if not args.output or not args.output.strip():
             errors.append("Имя выходного файла не может быть пустым")
-        else:
-            # Проверка расширения файла
-            valid_extensions = ['.png', '.jpg', '.jpeg', '.svg', '.pdf']
-            if not any(args.output.lower().endswith(ext) for ext in valid_extensions):
-                errors.append(f"Неподдерживаемое расширение файла. Допустимые: {', '.join(valid_extensions)}")
         
-        # Проверка существования файла в тестовом режиме
         if args.test_mode and not os.path.exists(args.source):
             errors.append(f"Тестовый файл не найден: {args.source}")
         
         return errors
     
-    def print_configuration(self, args):
-        """Вывод конфигурации в формате ключ-значение"""
-        print("Конфигурация приложения:")
-        print("=" * 40)
-        print(f"Имя анализируемого пакета: {args.package}")
-        print(f"Источник данных: {args.source}")
-        print(f"Режим тестирования: {'Включен' if args.test_mode else 'Выключен'}")
-        print(f"Выходной файл: {args.output}")
-        print(f"Режим ASCII-дерева: {'Включен' if args.ascii_tree else 'Выключен'}")
-        print("=" * 40)
-    
-    def get_github_repo_info(self, package_name):
-        """
-        Получение информации о репозитории GitHub из npm registry
-        """
-        npm_registry_url = "https://registry.npmjs.org/"
-        package_url = urljoin(npm_registry_url, package_name)
-        
+    def get_package_info_from_url(self, package_name):
+        """Получение информации о пакете из npm реестра"""
         try:
-            with urllib.request.urlopen(package_url) as response:
-                if response.status == 200:
-                    data = json.loads(response.read().decode())
-                    
-                    # Получаем URL репозитория из данных пакета
-                    if 'repository' in data:
-                        repo_info = data['repository']
-                        if isinstance(repo_info, dict) and 'url' in repo_info:
-                            repo_url = repo_info['url']
-                            # Очищаем URL от git+ и .git
-                            repo_url = repo_url.replace('git+', '').replace('.git', '')
-                            return repo_url
-                    
-                    # Если repository не найден, пробуем homepage
-                    if 'homepage' in data and 'github.com' in data['homepage']:
-                        return data['homepage']
-                        
-        except Exception as e:
-            print(f"Ошибка при получении информации о репозитории: {e}")
+            npm_registry_url = f"https://registry.npmjs.org/{package_name}"
             
-        return None
+            with urllib.request.urlopen(npm_registry_url) as response:
+                data = json.loads(response.read().decode())
+            
+            if 'dist-tags' in data and 'latest' in data['dist-tags']:
+                latest_version = data['dist-tags']['latest']
+            else:
+                latest_version = list(data.get('versions', {}).keys())[0]
+            
+            version_data = data['versions'][latest_version]
+            dependencies = version_data.get('dependencies', {})
+            
+            return {
+                'name': package_name,
+                'version': latest_version,
+                'dependencies': dependencies
+            }
+            
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise Exception(f"Пакет '{package_name}' не найден в npm реестре")
+            else:
+                raise Exception(f"Ошибка HTTP при запросе пакета: {e}")
+        except Exception as e:
+            raise Exception(f"Ошибка при получении информации о пакете '{package_name}': {e}")
     
-    def fetch_package_json_from_github(self, repo_url):
-        """
-        Получение package.json из репозитория GitHub
-        """
+    def get_package_info_from_file(self, package_name, file_path):
+        """Получение информации о пакете из тестового файла"""
         try:
-            # Преобразуем URL в raw content URL
-            if 'github.com' in repo_url:
-                # Преобразуем https://github.com/facebook/react в https://raw.githubusercontent.com/facebook/react/main/package.json
-                repo_url = repo_url.replace('https://github.com/', 'https://raw.githubusercontent.com/')
-                
-                # Пробуем разные возможные ветки
-                branches = ['main', 'master', 'latest']
-                for branch in branches:
-                    package_json_url = f"{repo_url}/{branch}/package.json"
-                    print(f"Попытка получить package.json из: {package_json_url}")
-                    
-                    try:
-                        with urllib.request.urlopen(package_json_url) as response:
-                            if response.status == 200:
-                                data = json.loads(response.read().decode())
-                                return data
-                    except urllib.error.HTTPError:
-                        continue
-                        
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+            
+            # Поддержка формата с пакетами в виде больших латинских букв
+            if package_name in data:
+                package_info = data[package_name]
+            else:
+                # Попробовать найти пакет в другом формате
+                raise Exception(f"Пакет '{package_name}' не найден в тестовом файле")
+            
+            return {
+                'name': package_name,
+                'version': package_info.get('version', '1.0.0'),
+                'dependencies': package_info.get('dependencies', {})
+            }
+            
         except Exception as e:
-            print(f"Ошибка при получении package.json из GitHub: {e}")
-            
-        return None
+            raise Exception(f"Ошибка при чтении тестового файла: {e}")
     
-    def get_dependencies_from_package_json(self, package_json):
-        """
-        Извлечение зависимостей из package.json
-        """
-        dependencies = {}
-        
-        try:
-            dependency_types = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']
-            
-            for dep_type in dependency_types:
-                if dep_type in package_json and package_json[dep_type]:
-                    dependencies.update(package_json[dep_type])
-                    print(f"Найдено {dep_type}: {len(package_json[dep_type])}")
-                    
-        except Exception as e:
-            print(f"Ошибка при извлечении зависимостей: {e}")
-            
-        return dependencies
-    
-    def fetch_from_npm_with_fallback(self, package_name):
-        """
-        Попытка получить зависимости из npm registry с fallback на GitHub
-        """
-        print("Попытка получить данные из npm registry...")
-        npm_registry_url = "https://registry.npmjs.org/"
-        package_url = urljoin(npm_registry_url, package_name)
-        
-        try:
-            with urllib.request.urlopen(package_url) as response:
-                if response.status == 200:
-                    data = json.loads(response.read().decode())
-                    
-                    # Пробуем получить зависимости из последней версии
-                    if 'dist-tags' in data and 'latest' in data['dist-tags']:
-                        latest_version = data['dist-tags']['latest']
-                        if 'versions' in data and latest_version in data['versions']:
-                            version_data = data['versions'][latest_version]
-                            dependencies = self.get_dependencies_from_package_json(version_data)
-                            
-                            if dependencies:
-                                return dependencies
-                            
-            print("Зависимости не найдены в npm registry, пробуем GitHub...")
-            
-            # Fallback на GitHub
-            repo_url = self.get_github_repo_info(package_name)
-            if repo_url:
-                print(f"Найден репозиторий: {repo_url}")
-                package_json = self.fetch_package_json_from_github(repo_url)
-                if package_json:
-                    return self.get_dependencies_from_package_json(package_json)
-                    
-        except Exception as e:
-            print(f"Ошибка при получении данных: {e}")
-            
-        return {}
-    
-    def load_test_package_data(self, file_path):
-        """
-        Загрузка тестовых данных из файла
-        """
-        try:
-            with open(file_path, 'r', encoding='utf-8') as file:
-                return json.load(file)
-        except Exception as e:
-            print(f"Ошибка при чтении тестового файла: {e}")
-            return None
-    
-    def display_dependencies(self, package_name, dependencies):
-        """
-        Вывод зависимостей на экран
-        """
-        if not dependencies:
-            print(f"Прямые зависимости не найдены")
+    def build_dependency_graph_bfs(self, start_package, args, depth=0, max_depth=10):
+        """Построение графа зависимостей с помощью BFS с рекурсией"""
+        if depth > max_depth:
+            print(f"Предупреждение: достигнута максимальная глубина {max_depth} для пакета {start_package}")
             return
+        
+        if start_package in self.recursion_stack:
+            print(f"Обнаружена циклическая зависимость: {start_package}")
+            self.cycle_detected = True
+            return
+        
+        if start_package in self.visited:
+            return
+        
+        self.visited.add(start_package)
+        self.recursion_stack.add(start_package)
+        
+        try:
+            # Получение информации о пакете
+            if args.test_mode:
+                package_info = self.get_package_info_from_file(start_package, args.source)
+            else:
+                package_info = self.get_package_info_from_url(start_package)
             
-        print(f"\nПрямые зависимости пакета '{package_name}':")
-        print("-" * 50)
+            dependencies = package_info.get('dependencies', {})
+            
+            # Сохраняем зависимости в графе
+            self.dependency_graph[start_package] = dependencies
+            
+            # Рекурсивно обрабатываем зависимости
+            for dep_name in dependencies.keys():
+                self.build_dependency_graph_bfs(dep_name, args, depth + 1, max_depth)
+                
+        except Exception as e:
+            print(f"Ошибка при обработке пакета {start_package}: {e}")
+        finally:
+            self.recursion_stack.remove(start_package)
+    
+    def print_ascii_tree(self, package, graph, prefix="", is_last=True):
+        """Вывод графа в формате ASCII-дерева"""
+        connectors = "└── " if is_last else "├── "
+        print(prefix + connectors + package)
         
-        for dep_name, dep_version in sorted(dependencies.items()):
-            print(f"  {dep_name}: {dep_version}")
+        dependencies = list(graph.get(package, {}).keys())
+        new_prefix = prefix + ("    " if is_last else "│   ")
         
-        print(f"\nВсего зависимостей: {len(dependencies)}")
+        for i, dep in enumerate(dependencies):
+            is_last_dep = i == len(dependencies) - 1
+            if dep in graph:
+                self.print_ascii_tree(dep, graph, new_prefix, is_last_dep)
+            else:
+                connector = "└── " if is_last_dep else "├── "
+                print(new_prefix + connector + dep + " (не раскрыто)")
+    
+    def print_graph_info(self):
+        """Вывод информации о построенном графе"""
+        print(f"\nИнформация о графе зависимостей:")
+        print("-" * 40)
+        print(f"Всего пакетов: {len(self.dependency_graph)}")
+        print(f"Обнаружены циклические зависимости: {'Да' if self.cycle_detected else 'Нет'}")
+        
+        total_dependencies = sum(len(deps) for deps in self.dependency_graph.values())
+        print(f"Всего зависимостей: {total_dependencies}")
+        print("-" * 40)
+        
+        print("\nДетали графа:")
+        for package, dependencies in self.dependency_graph.items():
+            print(f"\n{package}:")
+            for dep, version in dependencies.items():
+                status = "✓" if dep in self.dependency_graph else "✗"
+                print(f"  {status} {dep}: {version}")
+    
+    def demonstrate_test_cases(self):
+        """Демонстрация различных случаев работы с тестовым репозиторием"""
+        test_cases = [
+            {
+                "name": "Простая цепочка зависимостей",
+                "file": "test_simple.json",
+                "package": "A"
+            },
+            {
+                "name": "Циклические зависимости", 
+                "file": "test_cycle.json",
+                "package": "A"
+            },
+            {
+                "name": "Множественные зависимости",
+                "file": "test_complex.json", 
+                "package": "A"
+            }
+        ]
+        
+        print("\nДемонстрация работы с тестовыми случаями:")
+        print("=" * 50)
+        
+        for test_case in test_cases:
+            print(f"\nТестовый случай: {test_case['name']}")
+            print(f"Файл: {test_case['file']}, Пакет: {test_case['package']}")
+            
+            if os.path.exists(test_case['file']):
+                # Сбрасываем состояние для нового теста
+                self.dependency_graph.clear()
+                self.visited.clear()
+                self.recursion_stack.clear()
+                self.cycle_detected = False
+                
+                try:
+                    self.build_dependency_graph_bfs(
+                        test_case['package'], 
+                        argparse.Namespace(
+                            test_mode=True,
+                            source=test_case['file']
+                        )
+                    )
+                    self.print_graph_info()
+                except Exception as e:
+                    print(f"Ошибка: {e}")
+            else:
+                print(f"Файл {test_case['file']} не найден")
     
     def run(self):
         """Основной метод запуска приложения"""
@@ -256,32 +268,36 @@ class DependencyVisualizer:
                     print(f"  - {error}")
                 sys.exit(1)
             
-            # Вывод конфигурации
-            self.print_configuration(args)
+            print("Конфигурация приложения:")
+            print("=" * 40)
+            print(f"Имя анализируемого пакета: {args.package}")
+            print(f"Источник данных: {args.source}")
+            print(f"Режим тестирования: {'Включен' if args.test_mode else 'Выключен'}")
+            print(f"Выходной файл: {args.output}")
+            print(f"Режим ASCII-дерева: {'Включен' if args.ascii_tree else 'Выключен'}")
+            print("=" * 40)
             
-            # Получение данных о зависимостях
-            dependencies = {}
+            # Построение графа зависимостей
+            print(f"\nПостроение графа зависимостей для пакета '{args.package}'...")
+            self.build_dependency_graph_bfs(args.package, args)
             
+            # Вывод результатов
+            self.print_graph_info()
+            
+            # Вывод ASCII-дерева если запрошено
+            if args.ascii_tree:
+                print(f"\nASCII-дерево зависимостей для '{args.package}':")
+                print("=" * 50)
+                self.print_ascii_tree(args.package, self.dependency_graph)
+            
+            # Демонстрация тестовых случаев если в тестовом режиме
             if args.test_mode:
-                # Режим тестирования - загрузка из файла
-                print(f"\nЗагрузка тестовых данных из файла: {args.source}")
-                package_data = self.load_test_package_data(args.source)
-                if package_data:
-                    dependencies = self.get_dependencies_from_package_json(package_data)
-            else:
-                # Продакшн режим - получение данных
-                print(f"\nПолучение данных для пакета {args.package}...")
-                dependencies = self.fetch_from_npm_with_fallback(args.package)
+                self.demonstrate_test_cases()
             
-            # Вывод зависимостей (требование этапа 2)
-            self.display_dependencies(args.package, dependencies)
-            
-            print("\nЭтап 2 завершен успешно!")
+            print("\nЭтап 3 завершен успешно!")
             
         except Exception as e:
-            print(f"Критическая ошибка: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"Ошибка: {e}")
             sys.exit(1)
 
 if __name__ == "__main__":
