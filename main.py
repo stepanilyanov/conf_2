@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Инструмент визуализации графа зависимостей пакетов
-Этап 5: Визуализация (BFS с рекурсией)
+Этап 4: Дополнительные операции (BFS с рекурсией)
 """
 
 import argparse
@@ -10,20 +10,21 @@ import os
 import json
 import urllib.request
 import urllib.error
-import subprocess
-import tempfile
 from collections import deque, defaultdict
-import webbrowser
 
 class DependencyVisualizer:
     def __init__(self):
+        self.config = {}
         self.dependency_graph = defaultdict(dict)
+        self.reverse_dependency_graph = defaultdict(list)
         self.visited = set()
+        self.cycle_detected = False
+        self.cycle_paths = []
         
     def parse_arguments(self):
         """Парсинг аргументов командной строки"""
         parser = argparse.ArgumentParser(
-            description='Инструмент визуализации графа зависимостей пакетов - Этап 5',
+            description='Инструмент визуализации графа зависимостей пакетов - Этап 4',
             formatter_class=argparse.RawDescriptionHelpFormatter
         )
         
@@ -38,7 +39,7 @@ class DependencyVisualizer:
             '--source',
             type=str,
             required=True,
-            help='URL npm реестра или путь к тестовому файлу'
+            help='URL-адрес репозитория или путь к файлу тестового репозитория'
         )
         
         parser.add_argument(
@@ -49,39 +50,23 @@ class DependencyVisualizer:
         )
         
         parser.add_argument(
-            '--output',
-            type=str,
-            default='dependency_graph.svg',
-            help='Имя выходного файла'
-        )
-        
-        parser.add_argument(
-            '--ascii-tree',
+            '--reverse-deps',
             action='store_true',
             default=False,
-            help='Вывод зависимостей в формате ASCII-дерева'
+            help='Показать обратные зависимости (пакеты, зависящие от данного)'
         )
         
         parser.add_argument(
-            '--format',
+            '--reverse-for',
             type=str,
-            choices=['svg', 'png', 'pdf'],
-            default='svg',
-            help='Формат выходного файла'
-        )
-        
-        parser.add_argument(
-            '--compare-npm',
-            action='store_true',
-            default=False,
-            help='Сравнить с выводом npm'
+            help='Имя пакета для показа обратных зависимостей'
         )
         
         parser.add_argument(
             '--depth',
             type=int,
-            default=3,
-            help='Глубина анализа зависимостей'
+            default=5,
+            help='Максимальная глубина рекурсии'
         )
         
         return parser.parse_args()
@@ -96,15 +81,15 @@ class DependencyVisualizer:
         if not args.source or not args.source.strip():
             errors.append("Источник (URL или путь к файлу) не может быть пустым")
         
-        if not args.output or not args.output.strip():
-            errors.append("Имя выходного файла не может быть пустым")
-        
         if args.test_mode and not os.path.exists(args.source):
             errors.append(f"Тестовый файл не найден: {args.source}")
         
+        if args.depth <= 0:
+            errors.append("Глубина должна быть положительным числом")
+        
         return errors
     
-    def get_package_info_from_npm(self, package_name):
+    def get_package_info_from_url(self, package_name):
         """Получение информации о пакете из npm реестра"""
         try:
             npm_registry_url = f"https://registry.npmjs.org/{package_name}"
@@ -114,19 +99,26 @@ class DependencyVisualizer:
             
             if 'dist-tags' in data and 'latest' in data['dist-tags']:
                 latest_version = data['dist-tags']['latest']
-                version_data = data['versions'][latest_version]
-                dependencies = version_data.get('dependencies', {})
-                
-                return {
-                    'name': package_name,
-                    'version': latest_version,
-                    'dependencies': dependencies
-                }
             else:
-                raise Exception(f"Не удалось найти версию пакета {package_name}")
-                
+                # Берем первую доступную версию
+                latest_version = list(data.get('versions', {}).keys())[0]
+            
+            version_data = data['versions'][latest_version]
+            dependencies = version_data.get('dependencies', {})
+            
+            return {
+                'name': package_name,
+                'version': latest_version,
+                'dependencies': dependencies
+            }
+            
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise Exception(f"Пакет '{package_name}' не найден в npm реестре")
+            else:
+                raise Exception(f"Ошибка HTTP при запросе пакета: {e}")
         except Exception as e:
-            raise Exception(f"Ошибка при получении пакета {package_name}: {e}")
+            raise Exception(f"Ошибка при получении информации о пакете '{package_name}': {e}")
     
     def get_package_info_from_file(self, package_name, file_path):
         """Получение информации о пакете из тестового файла"""
@@ -137,12 +129,8 @@ class DependencyVisualizer:
             if package_name in data:
                 package_info = data[package_name]
             else:
-                # Возвращаем базовую информацию вместо ошибки
-                return {
-                    'name': package_name,
-                    'version': 'unknown',
-                    'dependencies': {}
-                }
+                # Пробуем найти пакет в другом формате
+                raise Exception(f"Пакет '{package_name}' не найден в тестовом файле")
             
             return {
                 'name': package_name,
@@ -151,13 +139,30 @@ class DependencyVisualizer:
             }
             
         except Exception as e:
-            print(f"Ошибка при чтении тестового файла: {e}")
-            # Возвращаем базовую информацию при ошибке
-            return {
-                'name': package_name,
-                'version': 'unknown',
-                'dependencies': {}
-            }
+            raise Exception(f"Ошибка при чтении тестового файла: {e}")
+    
+    def build_complete_dependency_graph(self, args):
+        """Построение полного графа зависимостей из тестового файла"""
+        if not args.test_mode:
+            return
+            
+        try:
+            with open(args.source, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            # Строим граф для всех пакетов в файле
+            for package_name in data.keys():
+                if package_name not in self.dependency_graph:
+                    package_info = self.get_package_info_from_file(package_name, args.source)
+                    dependencies = package_info.get('dependencies', {})
+                    self.dependency_graph[package_name] = dependencies
+                    
+                    # Строим обратный граф
+                    for dep_name in dependencies.keys():
+                        self.reverse_dependency_graph[dep_name].append(package_name)
+                        
+        except Exception as e:
+            print(f"Ошибка при построении полного графа: {e}")
     
     def build_dependency_graph_bfs_recursive(self, queue, args, max_depth=10):
         """Построение графа зависимостей с помощью BFS с рекурсией"""
@@ -179,21 +184,24 @@ class DependencyVisualizer:
             if args.test_mode:
                 package_info = self.get_package_info_from_file(current_package, args.source)
             else:
-                package_info = self.get_package_info_from_npm(current_package)
+                package_info = self.get_package_info_from_url(current_package)
             
             dependencies = package_info.get('dependencies', {})
             
             # Сохраняем зависимости в графе
-            self.dependency_graph[current_package] = {
-                'version': package_info.get('version', 'unknown'),
-                'dependencies': dependencies
-            }
+            self.dependency_graph[current_package] = dependencies
+            
+            # Строим обратный граф зависимостей
+            for dep_name in dependencies.keys():
+                self.reverse_dependency_graph[dep_name].append(current_package)
             
             # Обрабатываем зависимости через for, добавляем в очередь
             for dep_name in dependencies.keys():
                 # Проверка на циклические зависимости
-                if dep_name in self.dependency_graph and current_package in self.dependency_graph.get(dep_name, {}).get('dependencies', {}):
+                if dep_name in self.dependency_graph and current_package in self.dependency_graph.get(dep_name, {}):
                     print(f"Обнаружена циклическая зависимость: {current_package} <-> {dep_name}")
+                    self.cycle_detected = True
+                    self.cycle_paths.append([current_package, dep_name])
                     continue
                 
                 # Добавляем в очередь только если еще не посещали
@@ -203,6 +211,8 @@ class DependencyVisualizer:
                     
         except Exception as e:
             print(f"Ошибка при обработке пакета {current_package}: {e}")
+            # ВАЖНО: Даже при ошибке добавляем пакет в граф (без зависимостей)
+            self.dependency_graph[current_package] = {}
         
         # Рекурсивный вызов для обработки следующего пакета в очереди
         self.build_dependency_graph_bfs_recursive(queue, args, max_depth)
@@ -213,274 +223,241 @@ class DependencyVisualizer:
         self.visited.add(start_package)
         self.build_dependency_graph_bfs_recursive(queue, args, args.depth)
     
-    def generate_plantuml_code(self):
-        """Генерация кода PlantUML для визуализации графа"""
-        plantuml_code = [
-            "@startuml",
-            "skinparam monochrome true",
-            "skinparam shadowing false",
-            "skinparam defaultFontName Arial",
-            "skinparam packageStyle rect",
-            "left to right direction",
-            ""
-        ]
-        
-        # Добавляем узлы для всех пакетов
-        for package, info in self.dependency_graph.items():
-            version = info.get('version', 'unknown')
-            plantuml_code.append(f'package "{package}\\n{version}" as {self._sanitize_id(package)}')
-        
-        plantuml_code.append("")
-        
-        # Добавляем связи между пакетами
-        for package, info in self.dependency_graph.items():
-            for dep, version in info.get('dependencies', {}).items():
-                if dep in self.dependency_graph:
-                    plantuml_code.append(
-                        f'{self._sanitize_id(package)} --> {self._sanitize_id(dep)} : {version}'
-                    )
-        
-        plantuml_code.append("@enduml")
-        return "\n".join(plantuml_code)
-    
-    def _sanitize_id(self, name):
-        """Создание безопасного идентификатора для PlantUML"""
-        return name.replace('@', '').replace('/', '_').replace('-', '_').replace('.', '_')
-    
-    def generate_svg_from_plantuml(self, plantuml_code, output_file):
-        """Генерация SVG из кода PlantUML"""
-        try:
-            # Создаем временный файл для PlantUML кода
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.puml', delete=False) as f:
-                f.write(plantuml_code)
-                temp_puml = f.name
-            
-            # Пробуем использовать локальный PlantUML если установлен
-            try:
-                cmd = ['plantuml', '-tsvg', temp_puml]
-                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-                
-                # Переименовываем выходной файл
-                base_name = os.path.splitext(temp_puml)[0]
-                generated_svg = base_name + '.svg'
-                
-                if os.path.exists(generated_svg):
-                    os.rename(generated_svg, output_file)
-                    print(f"SVG сгенерирован локально: {output_file}")
-                else:
-                    raise FileNotFoundError("Локальный PlantUML не сгенерировал файл")
-                    
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                # Fallback: используем онлайн сервис PlantUML
-                print("Локальный PlantUML не найден, используем онлайн сервис...")
-                import urllib.parse
-                
-                # Кодируем PlantUML код для URL
-                encoded = self._encode_plantuml(plantuml_code)
-                online_url = f"http://www.plantuml.com/plantuml/svg/~1{encoded}"
-                
-                # Скачиваем SVG
-                with urllib.request.urlopen(online_url) as response:
-                    with open(output_file, 'wb') as f:
-                        f.write(response.read())
-                
-                print(f"SVG сгенерирован онлайн: {output_file}")
-            
-            # Удаляем временный файл
-            os.unlink(temp_puml)
-            
-        except Exception as e:
-            print(f"Ошибка генерации SVG: {e}")
-            # Сохраняем PlantUML код для ручной обработки
-            puml_file = output_file + '.puml'
-            with open(puml_file, 'w', encoding='utf-8') as f:
-                f.write(plantuml_code)
-            print(f"PlantUML код сохранен в: {puml_file}")
-    
-    def _encode_plantuml(self, text):
-        """Кодирование текста для PlantUML онлайн"""
-        import zlib
-        import base64
-        
-        # Compress the text
-        compressed = zlib.compress(text.encode('utf-8'))
-        # Encode in base64
-        encoded = base64.b64encode(compressed).decode('ascii')
-        # Re-encode for URL
-        return encoded.translate(str.maketrans(
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
-            "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_"
-        ))
-    
-    def print_ascii_tree_bfs_recursive(self, queue, prefix="", visited=None):
-        """Вывод ASCII-дерева зависимостей с помощью BFS с рекурсией"""
+    def find_reverse_dependencies_bfs_recursive(self, queue, visited, reverse_deps):
+        """Поиск обратных зависимостей с помощью BFS с рекурсией"""
+        # Базовый случай рекурсии - очередь пуста
         if not queue:
             return
-            
-        if visited is None:
-            visited = set()
         
-        current_level_size = len(queue)
-        next_level_queue = deque()
+        # Берем пакет из начала очереди
+        current_package = queue.popleft()
         
-        for i, package in enumerate(queue):
-            if package in visited:
-                continue
-                
-            visited.add(package)
-            
-            if package in self.dependency_graph:
-                version = self.dependency_graph[package].get('version', 'unknown')
-                connector = "└── " if i == current_level_size - 1 else "├── "
-                print(f"{prefix}{connector}{package} ({version})")
-                
-                # Добавляем зависимости в очередь следующего уровня
-                dependencies = list(self.dependency_graph[package].get('dependencies', {}).keys())
-                for dep in dependencies:
-                    if dep not in visited:
-                        next_level_queue.append(dep)
-            else:
-                connector = "└── " if i == current_level_size - 1 else "├── "
-                print(f"{prefix}{connector}{package} (не раскрыто)")
+        # Добавляем в результат
+        if current_package not in reverse_deps:
+            reverse_deps.add(current_package)
         
-        # Рекурсивный вызов для следующего уровня
-        if next_level_queue:
-            new_prefix = prefix + "    "
-            self.print_ascii_tree_bfs_recursive(next_level_queue, new_prefix, visited)
+        # Обрабатываем обратные зависимости через for
+        for dependent in self.reverse_dependency_graph.get(current_package, []):
+            if dependent not in visited:
+                visited.add(dependent)
+                queue.append(dependent)
+        
+        # Рекурсивный вызов для обработки следующего пакета в очереди
+        self.find_reverse_dependencies_bfs_recursive(queue, visited, reverse_deps)
     
-    def print_ascii_tree(self, package):
-        """Обертка для вывода ASCII-дерева с BFS рекурсией"""
-        queue = deque([package])
-        self.print_ascii_tree_bfs_recursive(queue)
+    def find_reverse_dependencies(self, package_name):
+        """Поиск всех пакетов, которые зависят от заданного пакета с помощью BFS с рекурсией"""
+        reverse_deps = set()
+        visited = set([package_name])
+        queue = deque([package_name])
+        
+        self.find_reverse_dependencies_bfs_recursive(queue, visited, reverse_deps)
+        return reverse_deps
     
-    def compare_with_npm(self, package_name):
-        """Сравнение с выводом npm"""
-        print(f"\nСравнение с npm для пакета {package_name}:")
+    def build_reverse_dependency_tree_bfs_recursive(self, queue, visited, tree):
+        """Построение дерева обратных зависимостей с помощью BFS с рекурсией"""
+        # Базовый случай рекурсии - очередь пуста
+        if not queue:
+            return
+        
+        # Берем пакет из начала очереди
+        current_package = queue.popleft()
+        
+        # Обрабатываем обратные зависимости через for
+        for dependent in self.reverse_dependency_graph.get(current_package, []):
+            if dependent not in visited:
+                visited.add(dependent)
+                tree[current_package].append(dependent)
+                queue.append(dependent)
+        
+        # Рекурсивный вызов для обработки следующего пакета в очереди
+        self.build_reverse_dependency_tree_bfs_recursive(queue, visited, tree)
+    
+    def build_reverse_dependency_tree(self, package_name):
+        """Построение дерева обратных зависимостей с помощью BFS с рекурсией"""
+        tree = defaultdict(list)
+        visited = set([package_name])
+        queue = deque([package_name])
+        
+        self.build_reverse_dependency_tree_bfs_recursive(queue, visited, tree)
+        return tree
+    
+    def find_tree_roots(self, tree, all_nodes):
+        """Нахождение корневых узлов дерева"""
+        # Все узлы, которые являются зависимыми
+        all_dependents = set()
+        for deps in tree.values():
+            all_dependents.update(deps)
+        
+        # Корни - узлы, которые никто не зависит от них в этом дереве
+        roots = [node for node in all_nodes if node not in all_dependents]
+        return roots
+    
+    def print_reverse_dependencies(self, package_name):
+        """Вывод обратных зависимостей в виде дерева"""
+        reverse_deps = self.find_reverse_dependencies(package_name)
+        
+        if not reverse_deps:
+            print(f"\nНет пакетов, зависящих от '{package_name}'")
+            return
+        
+        print(f"\nПакеты, зависящие от '{package_name}':")
         print("=" * 50)
         
-        try:
-            # Получаем дерево зависимостей через npm
-            cmd = ['npm', 'view', package_name, 'dependencies', '--json']
-            result = subprocess.run(cmd, capture_output=True, text=True)
+        # Строим дерево обратных зависимостей
+        tree = self.build_reverse_dependency_tree(package_name)
+        
+        # Собираем все узлы дерева
+        all_nodes = set([package_name])
+        for deps in tree.values():
+            all_nodes.update(deps)
+        
+        roots = self.find_tree_roots(tree, all_nodes)
+        
+        def print_tree_bfs_recursive(queue, prefix="", visited=None):
+            """Вывод дерева с помощью BFS с рекурсией"""
+            if not queue:
+                return
+                
+            if visited is None:
+                visited = set()
             
-            if result.returncode == 0 and result.stdout.strip():
-                npm_deps = json.loads(result.stdout)
-                our_deps = self.dependency_graph.get(package_name, {}).get('dependencies', {})
-                
-                print("Наши зависимости:")
-                for dep, version in sorted(our_deps.items()):
-                    print(f"  {dep}: {version}")
-                
-                print("\nЗависимости через npm:")
-                for dep, version in sorted(npm_deps.items()):
-                    print(f"  {dep}: {version}")
-                
-                # Анализ расхождений
-                our_deps_set = set(our_deps.keys())
-                npm_deps_set = set(npm_deps.keys())
-                
-                only_in_our = our_deps_set - npm_deps_set
-                only_in_npm = npm_deps_set - our_deps_set
-                common = our_deps_set & npm_deps_set
-                
-                print(f"\nАнализ расхождений:")
-                print(f"Общие зависимости: {len(common)}")
-                print(f"Только у нас: {len(only_in_our)}")
-                print(f"Только в npm: {len(only_in_npm)}")
-                
-                if only_in_our:
-                    print(f"Зависимости только в нашем анализе: {', '.join(sorted(only_in_our))}")
-                if only_in_npm:
-                    print(f"Зависимости только в npm: {', '.join(sorted(only_in_npm))}")
-                
-                # Анализ версий для общих зависимостей
-                version_differences = []
-                for dep in common:
-                    if our_deps[dep] != npm_deps[dep]:
-                        version_differences.append(f"{dep}: наша версия {our_deps[dep]} vs npm {npm_deps[dep]}")
-                
-                if version_differences:
-                    print(f"Различия в версиях:")
-                    for diff in version_differences:
-                        print(f"  {diff}")
-                
-                # Объяснение возможных причин расхождений
-                if only_in_our or only_in_npm or version_differences:
-                    print(f"\nВозможные причины расхождений:")
-                    print("1. Кэширование данных в npm реестре")
-                    print("2. Разные версии пакетов (latest vs конкретная версия)")
-                    print("3. devDependencies vs dependencies")
-                    print("4. peerDependencies не учитываются в нашем анализе")
-                    print("5. Временные задержки в обновлении реестра")
+            current_level_size = len(queue)
+            next_level_queue = deque()
+            
+            for i, node in enumerate(queue):
+                if node in visited:
+                    connector = "└── " if i == current_level_size - 1 else "├── "
+                    print(prefix + connector + node + " (циклическая ссылка)")
+                    continue
                     
-            else:
-                print("Не удалось получить данные из npm")
+                visited.add(node)
                 
-        except Exception as e:
-            print(f"Ошибка при сравнении с npm: {e}")
+                connector = "└── " if i == current_level_size - 1 else "├── "
+                node_display = node
+                if node == package_name:
+                    node_display += " (целевой пакет)"
+                print(prefix + connector + node_display)
+                
+                # Добавляем детей в очередь следующего уровня
+                children = sorted(tree.get(node, []))
+                for child in children:
+                    next_level_queue.append(child)
+            
+            # Рекурсивный вызов для следующего уровня
+            if next_level_queue:
+                new_prefix = prefix + "    "
+                print_tree_bfs_recursive(next_level_queue, new_prefix, visited)
+        
+        # Выводим дерево начиная с корней
+        if roots:
+            print_tree_bfs_recursive(deque(roots))
+        else:
+            # Если корней нет (циклическая зависимость), начинаем с целевого пакета
+            print_tree_bfs_recursive(deque([package_name]))
     
-    def demonstrate_visualization_cases(self):
-        """Демонстрация визуализации для различных пакетов"""
-        demo_packages = [
+    def demonstrate_reverse_deps_cases(self):
+        """Демонстрация различных случаев обратных зависимостей"""
+        test_cases = [
             {
-                "name": "React (простая структура)",
-                "package": "react",
-                "file": "test_react.json"
+                "name": "Простая цепочка обратных зависимостей",
+                "file": "test_simple.json",
+                "target_package": "C"
             },
             {
-                "name": "Express (средняя сложность)", 
-                "package": "express",
-                "file": "test_express.json"
+                "name": "Множественные обратные зависимости",
+                "file": "test_complex.json", 
+                "target_package": "D"
             },
             {
-                "name": "Webpack (сложная структура)",
-                "package": "webpack",
-                "file": "test_webpack.json"
+                "name": "Циклические зависимости с обратными связями",
+                "file": "test_cycle.json",
+                "target_package": "A"
             }
         ]
         
-        print("\nДемонстрация визуализации для различных пакетов:")
+        print("\nДемонстрация обратных зависимостей для тестовых случаев:")
         print("=" * 60)
         
-        for demo in demo_packages:
-            print(f"\nПакет: {demo['name']}")
-            print(f"Файл: {demo['file']}")
+        for test_case in test_cases:
+            print(f"\nТестовый случай: {test_case['name']}")
+            print(f"Файл: {test_case['file']}, Целевой пакет: {test_case['target_package']}")
             
-            if os.path.exists(demo['file']):
-                # Сбрасываем состояние
+            if os.path.exists(test_case['file']):
+                # Сбрасываем состояние для нового теста
                 self.dependency_graph.clear()
+                self.reverse_dependency_graph.clear()
                 self.visited.clear()
+                self.cycle_detected = False
+                self.cycle_paths.clear()
                 
                 try:
-                    # Строим граф с BFS рекурсией
+                    # Строим полный граф из тестового файла
                     args = argparse.Namespace(
                         test_mode=True,
-                        source=demo['file'],
-                        depth=3
+                        source=test_case['file'],
+                        depth=5
                     )
-                    self.build_dependency_graph_bfs(demo['package'], args)
+                    self.build_complete_dependency_graph(args)
                     
-                    # Генерируем визуализацию
-                    output_file = f"{demo['package']}_demo.svg"
-                    plantuml_code = self.generate_plantuml_code()
-                    self.generate_svg_from_plantuml(plantuml_code, output_file)
+                    # Выводим обратные зависимости
+                    self.print_reverse_dependencies(test_case['target_package'])
                     
-                    # Выводим ASCII-дерево с BFS рекурсией
-                    print(f"\nASCII-дерево для {demo['package']}:")
-                    print("-" * 40)
-                    self.print_ascii_tree(demo['package'])
-                    
-                    print(f"\nSVG визуализация сохранена в: {output_file}")
-                    print(f"Всего узлов в графе: {len(self.dependency_graph)}")
+                    # Показываем информацию о циклах если есть
+                    if self.cycle_paths:
+                        print(f"\nОбнаруженные циклические зависимости:")
+                        for cycle in self.cycle_paths:
+                            print(f"  {' -> '.join(cycle)}")
                     
                 except Exception as e:
                     print(f"Ошибка: {e}")
             else:
-                print(f"Тестовый файл {demo['file']} не найден")
+                print(f"Файл {test_case['file']} не найден")
+    
+    def print_graph_statistics(self):
+        """Вывод статистики графа"""
+        print(f"\nСтатистика графа зависимостей:")
+        print("-" * 40)
+        print(f"Всего пакетов: {len(self.dependency_graph)}")
+        print(f"Всего зависимостей: {sum(len(deps) for deps in self.dependency_graph.values())}")
+        print(f"Обнаружены циклические зависимости: {'Да' if self.cycle_detected else 'Нет'}")
+        print(f"Размер графа обратных зависимостей: {len(self.reverse_dependency_graph)}")
+        
+        # Статистика по обратным зависимостям
+        if self.reverse_dependency_graph:
+            reverse_deps_count = {pkg: len(deps) for pkg, deps in self.reverse_dependency_graph.items()}
+            if reverse_deps_count:
+                max_reverse_deps = max(reverse_deps_count.values())
+                popular_packages = [pkg for pkg, count in reverse_deps_count.items() 
+                                  if count == max_reverse_deps]
+                
+                print(f"Наиболее популярный пакет: {popular_packages[0]} ({max_reverse_deps} зависимостей)")
+        
+        # Информация о циклах
+        if self.cycle_paths:
+            print(f"Обнаружено циклических путей: {len(self.cycle_paths)}")
+            for i, cycle in enumerate(self.cycle_paths[:3]):  # Показываем первые 3 цикла
+                print(f"  Цикл {i+1}: {' -> '.join(cycle)}")
+        
+        # ВЫВОД ЗАВИСИМОСТЕЙ
+        print(f"\nПервые 15 пакетов и их зависимости:")
+        print("-" * 50)
+        count = 0
+        for package, dependencies in sorted(self.dependency_graph.items()):
+            if count >= 15:
+                break
+            if dependencies:
+                print(f"\n{package}:")
+                for dep, version in sorted(dependencies.items()):
+                    print(f"  → {dep}: {version}")
+            else:
+                print(f"\n{package}: (нет зависимостей)")
+            count += 1
     
     def run(self):
         """Основной метод запуска приложения"""
         try:
+            # Парсинг аргументов
             args = self.parse_arguments()
             
             # Валидация аргументов
@@ -491,52 +468,41 @@ class DependencyVisualizer:
                     print(f"  - {error}")
                 sys.exit(1)
             
-            print("Визуализатор графа зависимостей - Этап 5 (BFS с рекурсией)")
+            print("Конфигурация приложения (Этап 4 - BFS с рекурсией):")
             print("=" * 50)
-            print(f"Пакет: {args.package}")
-            print(f"Источник: {args.source}")
-            print(f"Режим тестирования: {'Да' if args.test_mode else 'Нет'}")
-            print(f"Глубина анализа: {args.depth}")
+            print(f"Имя анализируемого пакета: {args.package}")
+            print(f"Источник данных: {args.source}")
+            print(f"Режим тестирования: {'Включен' if args.test_mode else 'Выключен'}")
+            print(f"Режим обратных зависимостей: {'Включен' if args.reverse_deps else 'Выключен'}")
+            if args.reverse_for:
+                print(f"Поиск обратных зависимостей для: {args.reverse_for}")
+            print(f"Максимальная глубина: {args.depth}")
             print("=" * 50)
             
-            # Построение графа зависимостей с BFS рекурсией
-            print(f"\nПостроение графа зависимостей (BFS с рекурсией)...")
-            self.build_dependency_graph_bfs(args.package, args)
+            # Построение графа зависимостей
+            print(f"\nПостроение графа зависимостей для пакета '{args.package}'...")
             
-            print(f"Построено узлов: {len(self.dependency_graph)}")
-            
-            # Вывод ASCII-дерева если запрошено
-            if args.ascii_tree:
-                print(f"\nASCII-дерево зависимостей для {args.package} (BFS):")
-                print("=" * 50)
-                self.print_ascii_tree(args.package)
-            
-            # Генерация PlantUML и SVG
-            print(f"\nГенерация визуализации...")
-            plantuml_code = self.generate_plantuml_code()
-            print("Код PlantUML сгенерирован")
-            
-            # Сохраняем PlantUML код
-            puml_file = os.path.splitext(args.output)[0] + '.puml'
-            with open(puml_file, 'w', encoding='utf-8') as f:
-                f.write(plantuml_code)
-            print(f"PlantUML код сохранен в: {puml_file}")
-            
-            # Генерируем SVG
-            self.generate_svg_from_plantuml(plantuml_code, args.output)
-            
-            # Сравнение с npm если запрошено
-            if args.compare_npm and not args.test_mode:
-                self.compare_with_npm(args.package)
-            
-            # Демонстрация различных случаев
             if args.test_mode:
-                self.demonstrate_visualization_cases()
+                # В тестовом режиме строим полный граф из файла
+                self.build_complete_dependency_graph(args)
+            else:
+                # В продакшн режиме строим граф BFS с рекурсией
+                self.build_dependency_graph_bfs(args.package, args)
             
-            print(f"\nЭтап 5 завершен успешно!")
-            print(f"Результаты сохранены в:")
-            print(f"  - {puml_file} (PlantUML код)")
-            print(f"  - {args.output} (SVG визуализация)")
+            # Вывод статистики
+            self.print_graph_statistics()
+            
+            # Обработка обратных зависимостей
+            if args.reverse_deps or args.reverse_for:
+                target_package = args.reverse_for if args.reverse_for else args.package
+                print(f"\nАнализ обратных зависимостей для пакета '{target_package}':")
+                self.print_reverse_dependencies(target_package)
+            
+            # Демонстрация тестовых случаев если в тестовом режиме
+            if args.test_mode:
+                self.demonstrate_reverse_deps_cases()
+            
+            print("\nЭтап 4 завершен успешно!")
             
         except Exception as e:
             print(f"Ошибка: {e}")
